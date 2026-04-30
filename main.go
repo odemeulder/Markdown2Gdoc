@@ -180,17 +180,17 @@ func convertMarkdown(src []byte) (string, error) {
 	return "<html><body>" + buf.String() + "</body></html>", nil
 }
 
-func uploadToDrive(ctx context.Context, client *http.Client, title, html string) (string, error) {
+func uploadToDrive(ctx context.Context, client *http.Client, title, mimeType, contentType string, body io.Reader) (string, error) {
 	svc, err := drive.NewService(ctx, option.WithHTTPClient(client))
 	if err != nil {
 		return "", fmt.Errorf("creating drive service: %w", err)
 	}
 	meta := &drive.File{
 		Name:     title,
-		MimeType: "application/vnd.google-apps.document",
+		MimeType: mimeType,
 	}
 	file, err := svc.Files.Create(meta).
-		Media(strings.NewReader(html), googleapi.ContentType("text/html")).
+		Media(body, googleapi.ContentType(contentType)).
 		Fields("id").
 		Do()
 	if err != nil {
@@ -199,9 +199,27 @@ func uploadToDrive(ctx context.Context, client *http.Client, title, html string)
 	return file.Id, nil
 }
 
+func convertToSlides(mdPath string) ([]byte, error) {
+	tmp, err := os.CreateTemp("", "mdtogdoc-*.pptx")
+	if err != nil {
+		return nil, err
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	cmd := exec.Command("marp", "--pptx", "--output", tmp.Name(), mdPath)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("marp failed (is marp installed? https://marp.app): %w", err)
+	}
+	return os.ReadFile(tmp.Name())
+}
+
 func main() {
 	setup := flag.Bool("setup", false, "run OAuth flow to authenticate")
 	title := flag.String("title", "", "document title (default: filename stem)")
+	slides := flag.Bool("slides", false, "create a Google Slides presentation (requires marp in PATH)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -222,6 +240,8 @@ func main() {
 
 	var src []byte
 	var docTitle string
+	var inputFilePath string
+	readFromStdin := false
 
 	args := flag.Args()
 	switch len(args) {
@@ -232,16 +252,18 @@ func main() {
 			os.Exit(1)
 		}
 		docTitle = "Untitled Document"
+		readFromStdin = true
 	case 1:
-		src, err = os.ReadFile(args[0])
+		inputFilePath = args[0]
+		src, err = os.ReadFile(inputFilePath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error reading file:", err)
 			os.Exit(1)
 		}
-		stem := strings.TrimSuffix(filepath.Base(args[0]), filepath.Ext(args[0]))
+		stem := strings.TrimSuffix(filepath.Base(inputFilePath), filepath.Ext(inputFilePath))
 		docTitle = stem
 	default:
-		fmt.Fprintln(os.Stderr, "usage: mdtogdoc [-title TITLE] [-setup] [FILE]")
+		fmt.Fprintln(os.Stderr, "usage: mdtogdoc [-title TITLE] [-slides] [-setup] [FILE]")
 		os.Exit(1)
 	}
 
@@ -255,17 +277,50 @@ func main() {
 		os.Exit(1)
 	}
 
-	html, err := convertMarkdown(src)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error converting markdown:", err)
-		os.Exit(1)
+	if *slides {
+		mdPath := inputFilePath
+		if readFromStdin {
+			f, err := os.CreateTemp("", "mdtogdoc-*.md")
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error creating temp file:", err)
+				os.Exit(1)
+			}
+			if _, err := f.Write(src); err != nil {
+				fmt.Fprintln(os.Stderr, "error writing temp file:", err)
+				os.Exit(1)
+			}
+			f.Close()
+			defer os.Remove(f.Name())
+			mdPath = f.Name()
+		}
+		pptx, err := convertToSlides(mdPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		id, err := uploadToDrive(ctx, client, docTitle,
+			"application/vnd.google-apps.presentation",
+			"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+			bytes.NewReader(pptx))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("https://docs.google.com/presentation/d/%s/edit\n", id)
+	} else {
+		html, err := convertMarkdown(src)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error converting markdown:", err)
+			os.Exit(1)
+		}
+		id, err := uploadToDrive(ctx, client, docTitle,
+			"application/vnd.google-apps.document",
+			"text/html",
+			strings.NewReader(html))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("https://docs.google.com/document/d/%s/edit\n", id)
 	}
-
-	id, err := uploadToDrive(ctx, client, docTitle, html)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("https://docs.google.com/document/d/%s/edit\n", id)
 }
